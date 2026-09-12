@@ -1,8 +1,7 @@
 """
 Senders.
 
-Stop-and-wait and Go-Back-N; Selective Repeat joins them here later. All
-share BaseSender.
+Stop-and-wait, Go-Back-N, and Selective Repeat, all sharing BaseSender.
 
 The sender carries the hard half of reliability. Four things in here are
 easy to get subtly wrong:
@@ -36,6 +35,7 @@ from rdt.constants import (
     DEFAULT_CHANNEL_PORT,
     DEFAULT_WINDOW,
     MAX_GBN_WINDOW,
+    MAX_SR_WINDOW,
     FLAG_DATA,
     FLAG_FIN,
     INITIAL_TIMEOUT,
@@ -406,6 +406,202 @@ class GoBackNSender(BaseSender):
                         self._retransmitted.add(seq)
 
                     self._timer_start = time.monotonic()
+        finally:
+            with self._cv:
+                self._running = False
+                self._cv.notify_all()
+            listener.join(timeout=1.0)
+            self.metrics.stop()
+            self.close()
+
+        return self.metrics
+
+
+class SelectiveRepeatSender(BaseSender):
+    """A window of N, individual ACKs, one timer PER PACKET.
+
+    The difference from Go-Back-N is entirely in the recovery strategy.
+    Go-Back-N keeps one timer on the oldest unacked packet and, when it
+    fires, resends everything in flight. Selective Repeat keeps a timer for
+    each packet and resends only the one that actually expired.
+
+        acked:    0 1 2 . 4 5 . 7
+                        ^       ^
+                        3 and 6 missing -- resend exactly those two
+
+    In Go-Back-N, a missing packet 3 would force 4, 5, 6, 7 back onto the
+    wire as well, even though four of them arrived intact. That amplification
+    is what makes GBN collapse at high loss: one loss costs up to N
+    retransmissions.
+
+    The price is bookkeeping. The sender needs a per-packet timer table and
+    a set of acknowledged sequence numbers, because the window no longer
+    advances as a single block -- packet 5 can be acked while 3 is still
+    outstanding. `base` only slides forward across a CONTIGUOUS run of acks.
+
+    Sequence space constraint: window <= SEQ_SPACE / 2. If the window were
+    larger, the receiver could not distinguish a retransmission of an old
+    packet from a genuinely new one after the numbers wrap around, and it
+    would deliver duplicate data as fresh. tests/test_window.py demonstrates
+    the failure directly.
+    """
+
+    def __init__(self, *args, window: int = DEFAULT_WINDOW, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not 1 <= window <= MAX_SR_WINDOW:
+            raise ValueError(f"window must be 1..{MAX_SR_WINDOW}")
+        self.window = window
+
+        self._cv = threading.Condition()
+        self.base = 0
+        self.next_seq = 0
+        self._acked: set[int] = set()
+        self._timers: dict[int, float] = {}      # seq -> absolute deadline
+        self._attempts: dict[int, int] = {}      # seq -> transmissions so far
+        self._send_times: dict[int, float] = {}
+        self._retransmitted: set[int] = set()
+        self._running = True
+
+    # -- ack thread ---------------------------------------------------------
+
+    def _ack_listener(self, sizes: list[int]):
+        """ACKs are INDIVIDUAL here, not cumulative. Each one clears exactly
+        one packet, so a lost ACK is not covered by the next one -- it costs
+        a retransmission, exactly as in stop-and-wait. That is the trade for
+        not retransmitting whole windows."""
+        while True:
+            with self._cv:
+                if not self._running:
+                    return
+
+            self.sock.settimeout(0.1)
+            try:
+                raw, _ = self.sock.recvfrom(RECV_BUFFER)
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                continue
+            except OSError:
+                return
+
+            try:
+                pkt = Packet.from_bytes(raw)
+            except PacketError:
+                with self._cv:
+                    self.metrics.corrupt_received += 1
+                continue
+
+            if not pkt.is_ack:
+                continue
+
+            with self._cv:
+                self.metrics.acks_received += 1
+                seq = pkt.ack
+
+                if seq in self._acked or seq < self.base:
+                    self.metrics.duplicate_acks += 1
+                    continue
+
+                # Karn: only an unretransmitted packet gives a clean sample.
+                if seq not in self._retransmitted and seq in self._send_times:
+                    self._on_rtt_sample(time.monotonic() - self._send_times[seq])
+
+                self._acked.add(seq)
+                self._timers.pop(seq, None)      # cancel just this packet
+                if seq < len(sizes):
+                    self.metrics.payload_bytes_delivered += sizes[seq]
+
+                # Slide base across the contiguous run of acked packets.
+                # Unlike GBN, an ack in the middle of the window does not
+                # move base at all -- it just fills a hole.
+                moved = False
+                while self.base in self._acked:
+                    self.base += 1
+                    moved = True
+
+                self._log(
+                    f"ack={seq} individual"
+                    + (f", base -> {self.base}" if moved else " (fills a gap)")
+                )
+                self._cv.notify_all()
+
+    # -- main loop ----------------------------------------------------------
+
+    def send_file(self, path: str) -> Metrics:
+        chunks = list(self._chunks(path))
+        sizes = [len(payload) for _, payload, _ in chunks]
+        total = len(chunks)
+
+        self.metrics.start()
+        listener = threading.Thread(
+            target=self._ack_listener, args=(sizes,), daemon=True
+        )
+        listener.start()
+
+        try:
+            with self._cv:
+                while self.base < total:
+                    now = time.monotonic()
+
+                    # 1. Fill the window.
+                    while self.next_seq < self.base + self.window and self.next_seq < total:
+                        seq, payload, is_last = chunks[self.next_seq]
+                        flags = FLAG_DATA | (FLAG_FIN if is_last else 0)
+
+                        self._transmit(
+                            Packet(seq=seq, flags=flags, payload=payload),
+                            retransmission=False,
+                        )
+                        self._send_times[seq] = now
+                        self._timers[seq] = now + self.timeout
+                        self._attempts[seq] = 1
+
+                        self._log(
+                            f"seq={seq} sent  [base={self.base} "
+                            f"next={self.next_seq + 1} win={self.window}]"
+                        )
+                        self.next_seq += 1
+
+                    if self.base >= total:
+                        break
+
+                    # 2. Sleep until the earliest per-packet deadline.
+                    if self._timers:
+                        earliest_seq = min(self._timers, key=self._timers.get)
+                        remaining = self._timers[earliest_seq] - time.monotonic()
+                    else:
+                        earliest_seq, remaining = None, 0.05
+
+                    if remaining > 0:
+                        self._cv.wait(remaining)
+                        continue
+
+                    # 3. One timer expired: resend exactly that packet.
+                    if earliest_seq is None or earliest_seq in self._acked:
+                        self._timers.pop(earliest_seq, None)
+                        continue
+
+                    self._on_timeout()
+                    self._attempts[earliest_seq] += 1
+                    if self._attempts[earliest_seq] > MAX_RETRIES:
+                        raise TransferFailed(
+                            f"no ack for seq={earliest_seq} after "
+                            f"{MAX_RETRIES} attempts"
+                        )
+
+                    _, payload, is_last = chunks[earliest_seq]
+                    flags = FLAG_DATA | (FLAG_FIN if is_last else 0)
+                    self._transmit(
+                        Packet(seq=earliest_seq, flags=flags, payload=payload),
+                        retransmission=True,
+                    )
+                    self._retransmitted.add(earliest_seq)
+                    self._timers[earliest_seq] = time.monotonic() + self.timeout
+
+                    self._log(
+                        f"TIMEOUT seq={earliest_seq} alone, "
+                        f"rto now {self.timeout * 1000:.0f}ms"
+                    )
         finally:
             with self._cv:
                 self._running = False

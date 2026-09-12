@@ -13,12 +13,18 @@ import os
 import sys
 
 from rdt.constants import DEFAULT_CHANNEL_PORT, DEFAULT_WINDOW, INITIAL_TIMEOUT
-from rdt.sender import GoBackNSender, StopAndWaitSender, TransferFailed
+from rdt.sender import (
+    GoBackNSender,
+    SelectiveRepeatSender,
+    StopAndWaitSender,
+    TransferFailed,
+)
 
 # Adding Go-Back-N and Selective Repeat later is one line each here.
 PROTOCOLS = {
     "sw": StopAndWaitSender,
     "gbn": GoBackNSender,
+    "sr": SelectiveRepeatSender,
 }
 
 
@@ -34,9 +40,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Send a file over UDP, reliably.")
     p.add_argument("file", help="path to the file to send")
     p.add_argument("--protocol", choices=sorted(PROTOCOLS), default="sw",
-                   help="sw = stop-and-wait (default), gbn = go-back-n")
+                   help="sw = stop-and-wait (default), gbn = go-back-n, sr = selective repeat")
     p.add_argument("--window", type=int, default=DEFAULT_WINDOW,
-                   help=f"window size, gbn only (default: {DEFAULT_WINDOW})")
+                   help=f"window size, gbn/sr only (default: {DEFAULT_WINDOW})")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_CHANNEL_PORT,
                    help=f"port to send to — the channel (default: {DEFAULT_CHANNEL_PORT})")
