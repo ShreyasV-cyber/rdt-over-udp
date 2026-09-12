@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 samples/*.bin
 bench/plots/*.png
+received.bin
