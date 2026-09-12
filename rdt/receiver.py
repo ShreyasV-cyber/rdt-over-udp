@@ -36,6 +36,22 @@ from rdt.packet import Packet, PacketError
 LINGER_SECONDS = 2.0
 
 
+def _suppress_icmp_reset(sock: socket.socket):
+    """Stop Windows raising ConnectionResetError on UDP sockets.
+
+    When a datagram reaches a host with nothing bound to the target port, the
+    host replies with ICMP port-unreachable. Windows reports that as an
+    exception on the socket's next recv, which is surprising on a connectionless
+    protocol — Linux ignores it entirely. SIO_UDP_CONNRESET turns the behaviour
+    off so the code behaves the same on both platforms.
+    """
+    if hasattr(socket, "SIO_UDP_CONNRESET"):  # Windows only
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
+
+
 class BaseReceiver:
     """Socket plumbing, ACK sending, and output file handling."""
 
@@ -47,6 +63,7 @@ class BaseReceiver:
         verbose: bool = False,
     ):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _suppress_icmp_reset(self.sock)
         self.sock.bind((host, port))
         self.output_path = output_path
         self.verbose = verbose
@@ -66,6 +83,11 @@ class BaseReceiver:
         try:
             data, addr = self.sock.recvfrom(RECV_BUFFER)
         except socket.timeout:
+            return None, None
+        except ConnectionResetError:
+            # An ACK we sent bounced: the channel or sender has gone away.
+            # Windows-only noise, not a failure of this socket.
+            self._log("icmp port-unreachable on ack path")
             return None, None
 
         try:

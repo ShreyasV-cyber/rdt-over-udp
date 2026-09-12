@@ -32,18 +32,33 @@ import socket
 import time
 
 from rdt.constants import (
-    BACKOFF_FACTOR,
     DEFAULT_CHANNEL_PORT,
     FLAG_DATA,
     FLAG_FIN,
     INITIAL_TIMEOUT,
     MAX_RETRIES,
-    MAX_TIMEOUT,
     MSS,
     RECV_BUFFER,
 )
 from rdt.metrics import Metrics
 from rdt.packet import Packet, PacketError
+from rdt.rtt import RTTEstimator
+
+
+def _suppress_icmp_reset(sock: socket.socket):
+    """Stop Windows raising ConnectionResetError on UDP sockets.
+
+    When a datagram reaches a host with nothing bound to the target port, the
+    host replies with ICMP port-unreachable. Windows reports that as an
+    exception on the socket's next recv, which is surprising on a connectionless
+    protocol — Linux ignores it entirely. SIO_UDP_CONNRESET turns the behaviour
+    off so the code behaves the same on both platforms.
+    """
+    if hasattr(socket, "SIO_UDP_CONNRESET"):  # Windows only
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
 
 
 class TransferFailed(RuntimeError):
@@ -51,20 +66,43 @@ class TransferFailed(RuntimeError):
 
 
 class BaseSender:
-    """Socket plumbing, file chunking, and ACK reception."""
+    """Socket plumbing, file chunking, ACK reception, and RTT estimation."""
 
     def __init__(
         self,
         host: str = "127.0.0.1",
         port: int = DEFAULT_CHANNEL_PORT,
         timeout: float = INITIAL_TIMEOUT,
+        adaptive: bool = True,
         verbose: bool = False,
     ):
         self.dest = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.base_timeout = timeout
+        _suppress_icmp_reset(self.sock)
         self.verbose = verbose
         self.metrics = Metrics()
+
+        # adaptive=False pins the timeout, which is what the benchmark uses
+        # to show what the estimator is actually buying.
+        self.adaptive = adaptive
+        self.fixed_timeout = timeout
+        self.rtt = RTTEstimator(rto=timeout)
+
+    # -- timeout ------------------------------------------------------------
+
+    @property
+    def timeout(self) -> float:
+        return self.rtt.timeout if self.adaptive else self.fixed_timeout
+
+    def _on_rtt_sample(self, sample: float):
+        self.metrics.record_rtt(sample)
+        if self.adaptive:
+            self.rtt.update(sample)
+
+    def _on_timeout(self):
+        self.metrics.timeouts += 1
+        if self.adaptive:
+            self.rtt.backoff()
 
     # -- io -----------------------------------------------------------------
 
@@ -105,6 +143,13 @@ class BaseSender:
                 raw, _ = self.sock.recvfrom(RECV_BUFFER)
             except socket.timeout:
                 return False
+            except ConnectionResetError:
+                # Windows surfaces an ICMP "port unreachable" from a previous
+                # send as an exception on the *next* recv. Nothing is wrong
+                # with this socket — the destination just was not listening.
+                # Treat it as silence and let the deadline decide.
+                self._log("icmp port-unreachable (is the channel running?)")
+                continue
 
             try:
                 pkt = Packet.from_bytes(raw)
@@ -145,29 +190,29 @@ class StopAndWaitSender(BaseSender):
                 flags = FLAG_DATA | (FLAG_FIN if is_last else 0)
                 pkt = Packet(seq=seq, flags=flags, payload=payload)
 
-                timeout = self.base_timeout
-
                 for attempt in range(MAX_RETRIES):
+                    timeout = self.timeout
                     sent_at = time.monotonic()
                     self._transmit(pkt, retransmission=attempt > 0)
                     self._log(
                         f"seq={seq} {'FIN ' if is_last else ''}"
                         f"{len(payload)}B attempt={attempt + 1} "
-                        f"timeout={timeout:.3f}s"
+                        f"rto={timeout * 1000:.0f}ms"
                     )
 
                     if self._await_ack(seq, sent_at + timeout):
                         # Trap 3: only an unambiguous transmission yields a
                         # usable RTT sample.
                         if attempt == 0:
-                            self.metrics.record_rtt(time.monotonic() - sent_at)
+                            self._on_rtt_sample(time.monotonic() - sent_at)
                         self.metrics.payload_bytes_delivered += len(payload)
-                        self._log(f"seq={seq} acked")
+                        self._log(f"seq={seq} acked  [{self.rtt}]")
                         break
 
-                    self.metrics.timeouts += 1
-                    timeout = min(timeout * BACKOFF_FACTOR, MAX_TIMEOUT)
-                    self._log(f"seq={seq} timeout, backing off to {timeout:.3f}s")
+                    self._on_timeout()
+                    self._log(
+                        f"seq={seq} timeout, rto now {self.timeout * 1000:.0f}ms"
+                    )
                 else:
                     raise TransferFailed(
                         f"no ack for seq={seq} after {MAX_RETRIES} attempts"
