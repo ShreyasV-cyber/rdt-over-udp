@@ -12,12 +12,13 @@ import hashlib
 import os
 import sys
 
-from rdt.constants import DEFAULT_CHANNEL_PORT, INITIAL_TIMEOUT
-from rdt.sender import StopAndWaitSender, TransferFailed
+from rdt.constants import DEFAULT_CHANNEL_PORT, DEFAULT_WINDOW, INITIAL_TIMEOUT
+from rdt.sender import GoBackNSender, StopAndWaitSender, TransferFailed
 
 # Adding Go-Back-N and Selective Repeat later is one line each here.
 PROTOCOLS = {
     "sw": StopAndWaitSender,
+    "gbn": GoBackNSender,
 }
 
 
@@ -33,7 +34,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Send a file over UDP, reliably.")
     p.add_argument("file", help="path to the file to send")
     p.add_argument("--protocol", choices=sorted(PROTOCOLS), default="sw",
-                   help="sw = stop-and-wait (default)")
+                   help="sw = stop-and-wait (default), gbn = go-back-n")
+    p.add_argument("--window", type=int, default=DEFAULT_WINDOW,
+                   help=f"window size, gbn only (default: {DEFAULT_WINDOW})")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_CHANNEL_PORT,
                    help=f"port to send to — the channel (default: {DEFAULT_CHANNEL_PORT})")
@@ -48,16 +51,21 @@ def main(argv=None):
     if not os.path.isfile(args.file):
         p.error(f"no such file: {args.file}")
 
-    sender = PROTOCOLS[args.protocol](
+    kwargs = dict(
         host=args.host,
         port=args.port,
         timeout=args.timeout,
         verbose=args.verbose,
     )
+    if args.protocol != "sw":
+        kwargs["window"] = args.window
+
+    sender = PROTOCOLS[args.protocol](**kwargs)
 
     print(
         f"sending {args.file} ({os.path.getsize(args.file)} B) "
         f"to {args.host}:{args.port} via {args.protocol}"
+        + (f" (window {args.window})" if args.protocol != "sw" else "")
     )
 
     try:

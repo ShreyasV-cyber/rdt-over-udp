@@ -1,8 +1,8 @@
 """
 Receivers.
 
-Stop-and-wait only for now; Go-Back-N and Selective Repeat join it here
-later and share BaseReceiver.
+Stop-and-wait and Go-Back-N; Selective Repeat joins them here later. All
+share BaseReceiver.
 
 The receiver's job is smaller than the sender's but has three traps in it:
 
@@ -192,4 +192,103 @@ class StopAndWaitReceiver(BaseReceiver):
             if pkt.is_data or pkt.is_fin:
                 self.metrics.duplicates_received += 1
                 self._send_ack(min(pkt.seq, expected - 1), from_addr or addr)
+                self._log(f"seq={pkt.seq} retransmission during linger, re-acked")
+
+
+class GoBackNReceiver(BaseReceiver):
+    """Accept only the next in-order packet. Buffer nothing.
+
+    The Go-Back-N receiver is barely more complex than stop-and-wait, and
+    that is the whole design trade: the sender does all the work so the
+    receiver can stay cheap. Its entire state is one integer.
+
+    Anything arriving out of order is DISCARDED, even though it is perfectly
+    valid data that will have to be sent again. In exchange, the receiver
+    needs no buffer and no bookkeeping — which mattered enormously when this
+    protocol was designed and memory was the scarce resource.
+
+    ACKs are cumulative: re-ACKing `expected - 1` tells the sender
+    "everything through here is safe", whatever happened after it. So a lost
+    ACK costs nothing as long as a later one gets through — unlike
+    stop-and-wait, where every single ACK is load-bearing.
+
+    Selective Repeat is what you get when you decide the discarding is too
+    wasteful and give the receiver a buffer instead.
+    """
+
+    def run(self) -> Metrics:
+        expected = 0
+        last_addr = None
+        finished = False
+
+        self.metrics.start()
+
+        try:
+            while not finished:
+                pkt, addr = self._recv(timeout=None)
+
+                if pkt is None:
+                    continue  # corrupt: stay silent, the sender will time out
+
+                last_addr = addr
+
+                if not (pkt.is_data or pkt.is_fin):
+                    continue
+
+                if pkt.seq == expected:
+                    self._deliver(pkt.payload)
+                    self._send_ack(expected, addr)
+                    self._log(
+                        f"seq={pkt.seq} in order, delivered "
+                        f"{len(pkt.payload)}B, ack={expected}"
+                    )
+                    expected += 1
+
+                    if pkt.is_fin:
+                        finished = True
+
+                elif pkt.seq > expected:
+                    # Valid data, arrived too early. Thrown away — this is
+                    # the waste Selective Repeat exists to eliminate.
+                    self.metrics.out_of_order_received += 1
+                    if expected > 0:
+                        self._send_ack(expected - 1, addr)
+                    self._log(
+                        f"seq={pkt.seq} out of order (want {expected}), "
+                        f"discarded, re-ack={expected - 1}"
+                    )
+
+                else:
+                    # Already delivered. The sender never heard our ACK.
+                    self.metrics.duplicates_received += 1
+                    self._send_ack(expected - 1, addr)
+                    self._log(
+                        f"seq={pkt.seq} duplicate, re-ack={expected - 1}"
+                    )
+
+            self._linger(expected, last_addr)
+
+        finally:
+            self.metrics.stop()
+            self.close()
+
+        return self.metrics
+
+    def _linger(self, expected: int, addr):
+        """Same reasoning as stop-and-wait: our final ACK may not arrive."""
+        deadline = time.monotonic() + LINGER_SECONDS
+        self._log(f"transfer complete, lingering {LINGER_SECONDS}s")
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            pkt, from_addr = self._recv(timeout=remaining)
+            if pkt is None:
+                continue
+
+            if pkt.is_data or pkt.is_fin:
+                self.metrics.duplicates_received += 1
+                self._send_ack(expected - 1, from_addr or addr)
                 self._log(f"seq={pkt.seq} retransmission during linger, re-acked")

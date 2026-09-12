@@ -12,11 +12,12 @@ import os
 import sys
 
 from rdt.constants import DEFAULT_RECEIVER_PORT
-from rdt.receiver import StopAndWaitReceiver
+from rdt.receiver import GoBackNReceiver, StopAndWaitReceiver
 
 # Adding Go-Back-N and Selective Repeat later is one line each here.
 PROTOCOLS = {
     "sw": StopAndWaitReceiver,
+    "gbn": GoBackNReceiver,
 }
 
 
@@ -32,7 +33,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Receive a file over UDP, reliably.")
     p.add_argument("output", help="path to write the received file to")
     p.add_argument("--protocol", choices=sorted(PROTOCOLS), default="sw",
-                   help="sw = stop-and-wait (default)")
+                   help="sw = stop-and-wait (default), gbn = go-back-n")
     p.add_argument("--port", type=int, default=DEFAULT_RECEIVER_PORT,
                    help=f"port to bind (default: {DEFAULT_RECEIVER_PORT})")
     p.add_argument("--host", default="0.0.0.0")
